@@ -1,0 +1,223 @@
+{% extends "base.html" %}
+{% block title %}共测链比对 · 隔声试验数据交付复核{% endblock %}
+{% block content %}
+<h2>共测记录与共测链比对</h2>
+<p class="muted">
+  源库：{{ source }} ｜
+  <a href="/select">交付选择</a> ｜
+  <a href="/preview">交付预览</a> ｜
+  <a href="/">重新上传</a>
+</p>
+
+{% if flash %}<p class="{{ flash.kind }}">{{ flash.text }}</p>{% endif %}
+{% if error %}<p class="err">操作未生效：{{ error }}</p>{% endif %}
+
+<h3>一、登记共测记录</h3>
+<p class="muted">
+  每条记录填写试件号、两家实验室，以及两家实验室在该试件上各自同频读数的编号；
+  两条读数频率不一致会被拒绝。
+</p>
+<form method="post" action="/compare/records">
+  <input type="hidden" name="reference" value="{{ page.reference_lab or '' }}">
+  <table>
+    <tr>
+      <th>试件号</th>
+      <th>实验室 A</th>
+      <th>A 侧读数编号</th>
+      <th>实验室 B</th>
+      <th>B 侧读数编号</th>
+      <th></th>
+    </tr>
+    <tr>
+      <td><input name="specimen" required maxlength="200" placeholder="如 S-墙体-01"
+                 value="{{ form.specimen or '' }}"></td>
+      <td>
+        <select name="lab_a" required>
+          <option value="">（选择）</option>
+          {% for lab in page.labs %}
+          <option value="{{ lab.id }}" {% if form.lab_a == lab.id|string %}selected{% endif %}>{{ lab.name }}</option>
+          {% endfor %}
+        </select>
+      </td>
+      <td><input name="reading_a" type="number" required min="1" placeholder="读数 #"
+                 value="{{ form.reading_a or '' }}"></td>
+      <td>
+        <select name="lab_b" required>
+          <option value="">（选择）</option>
+          {% for lab in page.labs %}
+          <option value="{{ lab.id }}" {% if form.lab_b == lab.id|string %}selected{% endif %}>{{ lab.name }}</option>
+          {% endfor %}
+        </select>
+      </td>
+      <td><input name="reading_b" type="number" required min="1" placeholder="读数 #"
+                 value="{{ form.reading_b or '' }}"></td>
+      <td><button type="submit" class="primary">登记</button></td>
+    </tr>
+  </table>
+</form>
+
+<details style="margin:.5rem 0 1rem">
+  <summary class="muted">查看库中读数编号对照表（按实验室、频点排序）</summary>
+  {% for lab in page.labs %}
+  <div style="margin:.5rem 0">
+    <b>{{ lab.name }}</b>
+    {% if lab.readings %}
+    <table>
+      <tr><th>读数</th><th>试验</th><th>类型</th><th>频率 Hz</th><th>声级 dB</th></tr>
+      {% for r in lab.readings %}
+      <tr>
+        <td>#{{ r.id }}</td>
+        <td>{{ r.test }}</td>
+        <td>{{ r.kind }}</td>
+        <td>{{ r.frequency_hz if r.frequency_hz is not none else "—" }}</td>
+        <td>{{ r.level_db if r.level_db is not none else "—" }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="muted">（该实验室无读数）</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+</details>
+
+<h3>二、有效共测记录（{{ page.active_records|length }} 条）</h3>
+{% if page.active_records %}
+<table>
+  <tr>
+    <th>#</th><th>试件号</th><th>频点 Hz</th>
+    <th>实验室 A</th><th>A 侧读数</th>
+    <th>实验室 B</th><th>B 侧读数</th>
+    <th>登记时间</th><th>操作</th>
+  </tr>
+  {% for r in page.active_records %}
+  <tr>
+    <td>{{ r.id }}</td>
+    <td>{{ r.specimen }}</td>
+    <td>{{ r.frequency_label }}</td>
+    <td>{{ r.lab_a_name }}</td>
+    <td>{{ r.reading_a_label }}</td>
+    <td>{{ r.lab_b_name }}</td>
+    <td>{{ r.reading_b_label }}</td>
+    <td class="muted">{{ r.created_at }}</td>
+    <td>
+      <form method="post" action="/compare/records/{{ r.id }}/withdraw?reference={{ page.reference_lab or '' }}"
+            style="margin:0">
+        <button type="submit">撤回</button>
+      </form>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="muted">尚无有效共测记录。</p>
+{% if page.can_seed_demo %}
+<form method="post" action="/compare/seed-demo?reference={{ page.reference_lab or '' }}">
+  <button type="submit">载入演示共测记录（同一试件支撑多段共测链）</button>
+</form>
+{% endif %}
+{% endif %}
+
+{% if page.withdrawn_records %}
+<details style="margin:.5rem 0 1rem">
+  <summary class="muted">已撤回记录（{{ page.withdrawn_records|length }} 条，仅留档）</summary>
+  <table>
+    <tr><th>#</th><th>试件号</th><th>频点 Hz</th><th>两家实验室</th><th>撤回时间</th></tr>
+    {% for r in page.withdrawn_records %}
+    <tr>
+      <td>{{ r.id }}</td><td>{{ r.specimen }}</td><td>{{ r.frequency_label }}</td>
+      <td>{{ r.lab_a_name }} ↔ {{ r.lab_b_name }}</td>
+      <td class="muted">{{ r.withdrawn_at }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</details>
+{% endif %}
+
+<h3>三、逐频点比对结论</h3>
+<form method="get" action="/compare" style="margin:.5rem 0 1rem">
+  <label>参照实验室：
+    <select name="reference">
+      {% for lab in page.labs %}
+      <option value="{{ lab.id }}" {% if lab.id == page.reference_lab %}selected{% endif %}>
+        {{ lab.name }}
+      </option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit">按此参照查看</button>
+  <span class="muted">当前参照：{{ page.reference_name or "（无）" }}</span>
+</form>
+
+{% if not page.views %}
+<p class="muted">当前频点下暂无共测记录，无法形成可比对结论。</p>
+{% endif %}
+
+{% for v in page.views %}
+<fieldset>
+  <legend>{{ v.frequency_label }} Hz ｜ 参照 {{ page.reference_name }}</legend>
+  <p class="muted">{{ v.record_count }} 条有效共测记录 ｜ 可经共测链比对的实验室 {{ v.comparable_count }} 家</p>
+
+  <table>
+    <tr><th>实验室</th><th>能否与参照比对</th><th>共测链</th></tr>
+    {% for lab in v.labs %}
+    <tr>
+      <td>{{ lab.lab_name }}</td>
+      <td>
+        {% if lab.comparable %}
+        <span style="color:#2e7d32">可比</span>
+        {% else %}
+        <span style="color:#b71c1c">不可比（无共测链）</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if lab.path %}
+        {% for step in lab.path %}
+        <div class="muted" style="font-size:.82rem">
+          {{ step.from_lab_name }} 读数 #{{ step.from_reading }}
+          —〔{{ step.specimen }}〕→
+          {{ step.to_lab_name }} 读数 #{{ step.to_reading }}
+        </div>
+        {% endfor %}
+        {% else %}
+        <span class="muted">—</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  {% if v.critical %}
+  <p class="warn">
+    关键试件预警：撤掉以下试件的全部共测记录，会切断当前可比的实验室。
+  </p>
+  <table>
+    <tr><th>试件</th><th>撤掉后会断链的实验室</th><th>涉及记录</th></tr>
+    {% for c in v.critical %}
+    <tr>
+      <td><b>{{ c.specimen }}</b></td>
+      <td>{{ c.broken_lab_names|join("、") }}</td>
+      <td class="muted">{{ c.record_ids|join("、") }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">无关键试件：撤掉任一单个试件的共测记录都不会使当前可比实验室断链。</p>
+  {% endif %}
+
+  {% if v.confirmed %}
+  <p class="ok">
+    已确认（{{ v.confirmed_at }}）：本频点可比实验室与关键试件清单经负责人确认。
+  </p>
+  {% else %}
+  <form method="post" action="/compare/confirm">
+    <input type="hidden" name="reference" value="{{ page.reference_lab }}">
+    <input type="hidden" name="frequency" value="{{ v.frequency_raw }}">
+    <input type="hidden" name="token" value="{{ v.token }}">
+    <button type="submit" class="primary">确认所见结论（{{ v.frequency_label }} Hz）</button>
+    <span class="muted">确认后若连通性或关键试件清单变化，将自动回到待复核。</span>
+  </form>
+  {% endif %}
+</fieldset>
+{% endfor %}
+{% endblock %}

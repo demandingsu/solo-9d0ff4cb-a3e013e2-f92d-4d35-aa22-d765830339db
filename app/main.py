@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from fastapi import FastAPI, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from . import cotest
 from .core import build_subset, load_model, resolve, validate_schema
 
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
@@ -33,19 +35,52 @@ class SessionState:
     source_name: str
     selected_tests: set[int] = field(default_factory=set)
     excluded_readings: set[int] = field(default_factory=set)
+    # 同一会话的共测记录写操作串行化（跨进程由 SQLite BEGIN IMMEDIATE 兜底）
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def db_path(self) -> str:
         return os.path.join(self.workdir, "source.db")
 
+    @property
+    def cotest_path(self) -> str:
+        return os.path.join(self.workdir, cotest.SIDECAR_NAME)
 
-# 单进程内存会话；重启即失效（上传文件保留在 DATA_DIR 下，由运维清理）
+
+# 单进程内存会话；重启后若上传文件仍在 DATA_DIR，可凭原 cookie 自动恢复会话
 SESSIONS: dict[str, SessionState] = {}
+
+
+def _session_from_disk(sid: str) -> SessionState | None:
+    """进程重启后按 cookie 找回仍保留的工作目录（不信任任意路径）。"""
+    if not sid or not all(c in "0123456789abcdef" for c in sid):
+        return None
+    workdir = os.path.join(DATA_DIR, sid)
+    db_path = os.path.join(workdir, "source.db")
+    if not os.path.isfile(db_path):
+        return None
+    name_path = os.path.join(workdir, "source.name")
+    name = "source.db"
+    try:
+        with open(name_path, encoding="utf-8") as f:
+            stored = f.read().strip()
+        if stored:
+            name = stored
+    except OSError:
+        pass
+    return SessionState(workdir, name)
 
 
 def _get_session(request: Request) -> SessionState | None:
     sid = request.cookies.get("sid")
-    return SESSIONS.get(sid) if sid else None
+    if not sid:
+        return None
+    st = SESSIONS.get(sid)
+    if st is None:
+        st = _session_from_disk(sid)
+        if st is not None:
+            SESSIONS[sid] = st
+    return st
 
 
 def _load(st: SessionState):
@@ -54,6 +89,63 @@ def _load(st: SessionState):
         return load_model(conn)
     finally:
         conn.close()
+
+
+def _open_cotest(st: SessionState):
+    return cotest.open_sidecar(st.cotest_path)
+
+
+_MESSAGES = {
+    "registered": ("ok", "共测记录已登记；受影响的复核结论已按新连通性重算。"),
+    "withdrawn": ("ok", "共测记录已撤回；受影响的复核结论已按新连通性重算。"),
+    "demo": ("ok", "演示共测记录已载入（同一试件支撑多段共测链）。"),
+    "confirmed": ("ok", "已确认当前频点的比对结论。"),
+}
+
+
+def _compare_redirect(reference: int | None, code: str) -> RedirectResponse:
+    target = "/compare"
+    params = []
+    if reference is not None:
+        params.append(f"reference={reference}")
+    if code:
+        params.append(f"msg={code}")
+    if params:
+        target += "?" + "&".join(params)
+    return RedirectResponse(target, status_code=303)
+
+
+def _render_compare(
+    request: Request,
+    st: SessionState,
+    model,
+    reference: int | None,
+    *,
+    error: str | None = None,
+    status_code: int = 200,
+    flash_code: str | None = None,
+    preserve: dict | None = None,
+):
+    """渲染共测链页面；preserve 用于回填提交失败的表单值。"""
+    conn = _open_cotest(st)
+    try:
+        ref = cotest.resolve_reference(conn, model, reference)
+        page = cotest.build_page(conn, model, ref)
+    finally:
+        conn.close()
+    flash = _MESSAGES.get(flash_code) if flash_code else None
+    return templates.TemplateResponse(
+        request,
+        "compare.html",
+        {
+            "page": page,
+            "source": st.source_name,
+            "flash": {"kind": flash[0], "text": flash[1]} if flash else None,
+            "error": error,
+            "form": preserve or {},
+        },
+        status_code=status_code,
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -85,6 +177,8 @@ async def upload(request: Request, file: UploadFile):
         path = os.path.join(workdir, "source.db")
         with open(path, "wb") as f:
             f.write(data)
+        with open(os.path.join(workdir, "source.name"), "w", encoding="utf-8") as f:
+            f.write(file.filename or "source.db")
         try:
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
             errors = validate_schema(conn)
@@ -101,7 +195,9 @@ async def upload(request: Request, file: UploadFile):
             )
         SESSIONS[sid] = SessionState(workdir, file.filename or "source.db")
         resp = RedirectResponse("/select", status_code=303)
-        resp.set_cookie("sid", sid, httponly=True)
+        resp.set_cookie(
+            "sid", sid, httponly=True, samesite="lax", max_age=30 * 24 * 3600
+        )
         return resp
 
     return templates.TemplateResponse(
@@ -205,6 +301,185 @@ def preview(request: Request):
             "source": st.source_name,
         },
     )
+
+
+@app.get("/compare", response_class=HTMLResponse)
+def compare_page(request: Request, reference: str | None = None, msg: str = ""):
+    st = _get_session(request)
+    if not st:
+        return RedirectResponse("/", status_code=303)
+    model = _load(st)
+    ref: int | None = None
+    try:
+        ref = int(reference) if reference not in (None, "") else None
+    except ValueError:
+        ref = None
+    return _render_compare(request, st, model, ref, flash_code=msg)
+
+
+def _form_int(form, name: str) -> int | None:
+    try:
+        value = form.get(name)
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _form_int_query(request: Request) -> int | None:
+    try:
+        value = request.query_params.get("reference")
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+@app.post("/compare/records")
+async def add_record(request: Request):
+    st = _get_session(request)
+    if not st:
+        return RedirectResponse("/", status_code=303)
+    form = await request.form()
+    reference = _form_int(form, "reference")
+    preserve = {
+        "specimen": str(form.get("specimen") or ""),
+        "lab_a": str(form.get("lab_a") or ""),
+        "reading_a": str(form.get("reading_a") or ""),
+        "lab_b": str(form.get("lab_b") or ""),
+        "reading_b": str(form.get("reading_b") or ""),
+    }
+    model = _load(st)
+    try:
+        lab_a = _form_int(form, "lab_a")
+        lab_b = _form_int(form, "lab_b")
+        reading_a = _form_int(form, "reading_a")
+        reading_b = _form_int(form, "reading_b")
+        if None in (lab_a, lab_b, reading_a, reading_b):
+            raise cotest.ValidationError(
+                ["请填写两家实验室及各自的读数编号（整数）"]
+            )
+        with st.lock:
+            conn = _open_cotest(st)
+            try:
+                cotest.add_record(
+                    conn,
+                    model,
+                    preserve["specimen"],
+                    lab_a,
+                    reading_a,
+                    lab_b,
+                    reading_b,
+                )
+            finally:
+                conn.close()
+    except cotest.ValidationError as exc:
+        return _render_compare(
+            request,
+            st,
+            model,
+            reference,
+            error="；".join(exc.errors),
+            status_code=400,
+            preserve=preserve,
+        )
+    return _compare_redirect(reference, "registered")
+
+
+@app.post("/compare/records/{record_id}/withdraw")
+def withdraw_record(request: Request, record_id: int):
+    st = _get_session(request)
+    if not st:
+        return RedirectResponse("/", status_code=303)
+    model = _load(st)
+    reference = _form_int_query(request)
+    try:
+        with st.lock:
+            conn = _open_cotest(st)
+            try:
+                cotest.withdraw_record(conn, model, record_id)
+            finally:
+                conn.close()
+    except cotest.ValidationError as exc:
+        return _render_compare(
+            request,
+            st,
+            model,
+            reference,
+            error="；".join(exc.errors),
+            status_code=409,
+        )
+    return _compare_redirect(reference, "withdrawn")
+
+
+@app.post("/compare/confirm")
+async def confirm(request: Request):
+    st = _get_session(request)
+    if not st:
+        return RedirectResponse("/", status_code=303)
+    form = await request.form()
+    model = _load(st)
+    reference = _form_int(form, "reference")
+    frequency = str(form.get("frequency") or "")
+    token = str(form.get("token") or "")
+    try:
+        if reference is None:
+            raise cotest.ValidationError(["缺少参照实验室"])
+        try:
+            frequency_hz = float(frequency)
+        except ValueError:
+            raise cotest.ValidationError(["频点无效"])
+        with st.lock:
+            conn = _open_cotest(st)
+            try:
+                cotest.confirm_conclusion(
+                    conn, model, reference, frequency_hz, token
+                )
+            finally:
+                conn.close()
+    except cotest.StaleConclusion as exc:
+        return _render_compare(
+            request,
+            st,
+            model,
+            exc.current.reference_lab,
+            error="；".join(exc.errors),
+            status_code=409,
+        )
+    except cotest.ValidationError as exc:
+        return _render_compare(
+            request,
+            st,
+            model,
+            reference,
+            error="；".join(exc.errors),
+            status_code=400,
+        )
+    return _compare_redirect(reference, "confirmed")
+
+
+@app.post("/compare/seed-demo")
+def seed_demo(request: Request):
+    st = _get_session(request)
+    if not st:
+        return RedirectResponse("/", status_code=303)
+    model = _load(st)
+    reference = _form_int_query(request)
+    try:
+        with st.lock:
+            conn = _open_cotest(st)
+            try:
+                cotest.seed_demo(conn, model)
+            finally:
+                conn.close()
+    except cotest.ValidationError as exc:
+        return _render_compare(
+            request,
+            st,
+            model,
+            reference,
+            error="；".join(exc.errors),
+            status_code=400,
+        )
+    return _compare_redirect(reference, "demo")
 
 
 @app.post("/download")
